@@ -33,55 +33,77 @@ async def stream_music(
 
     client = genai.Client(api_key=key, http_options={"api_version": "v1alpha"})
 
+    import threading, queue
+
     target_bytes = int(duration * 48000 * 2 * 2)  # duration * rate * channels * bytes_per_sample
-    audio_buffer = bytearray()
 
-    # Phase 1: Collect audio from WebSocket
-    async with client.aio.live.music.connect(model="models/lyria-realtime-exp") as session:
-        await session.set_weighted_prompts(
-            prompts=[types.WeightedPrompt(text=prompt, weight=1.0)]
-        )
+    # Start aplay for raw PCM playback
+    aplay = subprocess.Popen(
+        ["aplay", "-D", device, "-f", "S16_LE", "-r", "48000", "-c", "2", "-t", "raw",
+         "--buffer-size", "192000"],
+        stdin=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
 
-        config_kwargs = {"bpm": bpm, "temperature": temperature}
-        if density is not None:
-            config_kwargs["density"] = density
-        if brightness is not None:
-            config_kwargs["brightness"] = brightness
+    audio_q = queue.Queue()
 
-        await session.set_music_generation_config(
-            config=types.LiveMusicGenerationConfig(**config_kwargs)
-        )
+    def writer():
+        """Write chunks to aplay stdin from a thread (handles backpressure)."""
+        while True:
+            data = audio_q.get()
+            if data is None:
+                break
+            try:
+                aplay.stdin.write(data)
+                aplay.stdin.flush()
+            except BrokenPipeError:
+                break
+        try:
+            aplay.stdin.close()
+        except Exception:
+            pass
 
-        await session.play()
-        print(f"Generating {duration}s of music...", flush=True)
+    writer_thread = threading.Thread(target=writer, daemon=True)
+    writer_thread.start()
 
-        async for message in session.receive():
-            if hasattr(message, "server_content") and message.server_content:
-                audio_chunks = getattr(message.server_content, "audio_chunks", None)
-                if audio_chunks:
-                    for chunk in audio_chunks:
-                        if chunk.data:
-                            audio_buffer.extend(chunk.data)
-                    if len(audio_buffer) >= target_bytes:
-                        break
+    bytes_received = 0
+    try:
+        async with client.aio.live.music.connect(model="models/lyria-realtime-exp") as session:
+            await session.set_weighted_prompts(
+                prompts=[types.WeightedPrompt(text=prompt, weight=1.0)]
+            )
 
-    # Trim to exact duration
-    audio_buffer = audio_buffer[:target_bytes]
-    print(f"Playing {len(audio_buffer) / (48000*2*2):.1f}s of audio...", flush=True)
+            config_kwargs = {"bpm": bpm, "temperature": temperature}
+            if density is not None:
+                config_kwargs["density"] = density
+            if brightness is not None:
+                config_kwargs["brightness"] = brightness
 
-    # Phase 2: Write WAV and play
-    import wave, tempfile
-    wav_path = tempfile.mktemp(suffix=".wav")
-    with wave.open(wav_path, "wb") as wf:
-        wf.setnchannels(2)
-        wf.setsampwidth(2)
-        wf.setframerate(48000)
-        wf.writeframes(bytes(audio_buffer))
+            await session.set_music_generation_config(
+                config=types.LiveMusicGenerationConfig(**config_kwargs)
+            )
 
-    print(f"Playing via {device}...", flush=True)
-    subprocess.run(["aplay", "-D", device, wav_path], stderr=subprocess.DEVNULL)
-    os.unlink(wav_path)
-    print("Done.", flush=True)
+            await session.play()
+            print(f"Streaming {duration}s of music live...", flush=True)
+
+            async for message in session.receive():
+                if hasattr(message, "server_content") and message.server_content:
+                    audio_chunks = getattr(message.server_content, "audio_chunks", None)
+                    if audio_chunks:
+                        for chunk in audio_chunks:
+                            if chunk.data:
+                                remaining = target_bytes - bytes_received
+                                data = chunk.data[:remaining] if len(chunk.data) > remaining else chunk.data
+                                audio_q.put(data)
+                                bytes_received += len(data)
+                        if bytes_received >= target_bytes:
+                            break
+    finally:
+        audio_q.put(None)  # Signal writer to stop
+        writer_thread.join()
+        aplay.wait()
+
+    print(f"Done. Streamed {bytes_received / (48000*2*2):.1f}s live.", flush=True)
 
 
 def main():
