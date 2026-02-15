@@ -33,56 +33,55 @@ async def stream_music(
 
     client = genai.Client(api_key=key, http_options={"api_version": "v1alpha"})
 
-    # Start aplay for raw PCM playback (16-bit LE, 48kHz, stereo)
-    aplay = subprocess.Popen(
-        ["aplay", "-D", device, "-f", "S16_LE", "-r", "48000", "-c", "2", "-t", "raw"],
-        stdin=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-    )
-
-    bytes_written = 0
     target_bytes = int(duration * 48000 * 2 * 2)  # duration * rate * channels * bytes_per_sample
+    audio_buffer = bytearray()
 
-    try:
-        async with client.aio.live.music.connect(model="models/lyria-realtime-exp") as session:
-            # Set the musical prompt
-            await session.set_weighted_prompts(
-                prompts=[types.WeightedPrompt(text=prompt, weight=1.0)]
-            )
+    # Phase 1: Collect audio from WebSocket
+    async with client.aio.live.music.connect(model="models/lyria-realtime-exp") as session:
+        await session.set_weighted_prompts(
+            prompts=[types.WeightedPrompt(text=prompt, weight=1.0)]
+        )
 
-            # Configure generation parameters
-            config_kwargs = {"bpm": bpm, "temperature": temperature}
-            if density is not None:
-                config_kwargs["density"] = density
-            if brightness is not None:
-                config_kwargs["brightness"] = brightness
+        config_kwargs = {"bpm": bpm, "temperature": temperature}
+        if density is not None:
+            config_kwargs["density"] = density
+        if brightness is not None:
+            config_kwargs["brightness"] = brightness
 
-            await session.set_music_generation_config(
-                config=types.LiveMusicGenerationConfig(**config_kwargs)
-            )
+        await session.set_music_generation_config(
+            config=types.LiveMusicGenerationConfig(**config_kwargs)
+        )
 
-            # Start playback
-            await session.play()
+        await session.play()
+        print(f"Generating {duration}s of music...", flush=True)
 
-            # Receive and pipe audio chunks
-            async for message in session.receive():
-                if hasattr(message, "server_content") and message.server_content:
-                    sc = message.server_content
-                    chunks = getattr(sc, "audio_chunks", None)
-                    if chunks:
-                        data = chunks.data if hasattr(chunks, "data") else chunks
-                        if isinstance(data, (bytes, bytearray)):
-                            aplay.stdin.write(data)
-                            aplay.stdin.flush()
-                            bytes_written += len(data)
-                            if bytes_written >= target_bytes:
-                                break
+        async for message in session.receive():
+            if hasattr(message, "server_content") and message.server_content:
+                audio_chunks = getattr(message.server_content, "audio_chunks", None)
+                if audio_chunks:
+                    for chunk in audio_chunks:
+                        if chunk.data:
+                            audio_buffer.extend(chunk.data)
+                    if len(audio_buffer) >= target_bytes:
+                        break
 
-            print(f"Streamed {bytes_written / (48000*2*2):.1f}s of audio.")
-    finally:
-        if aplay.stdin:
-            aplay.stdin.close()
-        aplay.wait()
+    # Trim to exact duration
+    audio_buffer = audio_buffer[:target_bytes]
+    print(f"Playing {len(audio_buffer) / (48000*2*2):.1f}s of audio...", flush=True)
+
+    # Phase 2: Write WAV and play
+    import wave, tempfile
+    wav_path = tempfile.mktemp(suffix=".wav")
+    with wave.open(wav_path, "wb") as wf:
+        wf.setnchannels(2)
+        wf.setsampwidth(2)
+        wf.setframerate(48000)
+        wf.writeframes(bytes(audio_buffer))
+
+    print(f"Playing via {device}...", flush=True)
+    subprocess.run(["aplay", "-D", device, wav_path], stderr=subprocess.DEVNULL)
+    os.unlink(wav_path)
+    print("Done.", flush=True)
 
 
 def main():
